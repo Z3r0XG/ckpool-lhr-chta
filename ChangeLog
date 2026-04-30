@@ -1,4 +1,6 @@
 See git repository ('git log') for full changelog.
 
-Git repository can be found at:
-https://bitbucket.org/ckolivas/ckpool
+Git repositories:
+- Fork: https://github.com/Z3r0XG/ckpool-lhr-chta
+- Parent: https://github.com/Z3r0XG/ckpool-lhr
+- Original: https://bitbucket.org/ckolivas/ckpool

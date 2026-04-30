@@ -427,8 +427,8 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 	len += wb->enonce2varlen;
 
 	wb->coinb2bin = ckzalloc(512);
-	memcpy(wb->coinb2bin, "\x0a\x63\x6b\x70\x6f\x6f\x6c\x2d\x6c\x68\x72", 11);
-	wb->coinb2len = 11;
+	memcpy(wb->coinb2bin, "\x0f\x63\x6b\x70\x6f\x6f\x6c\x2d\x6c\x68\x72\x2d\x63\x68\x74\x61", 16);
+	wb->coinb2len = 16;
 	if (ckp->btcsig) {
 		int siglen = strlen(ckp->btcsig);
 
@@ -576,7 +576,7 @@ static void generate_coinbase(ckpool_t *ckp, workbase_t *wb)
 		}
 		free(cb);
 		ckp->coinbase_valid = true;
-		LOGWARNING("Mining solo to any incoming valid BTC address username");
+		LOGWARNING("Mining solo to any incoming valid CHTA address username");
 		if (ckp->donation)
 			LOGWARNING("%.1f percent donation to %s", ckp->donation, ckp->donaddress);
 	}
@@ -1024,11 +1024,11 @@ static bool add_txn(ckpool_t *ckp, sdata_t *sdata, txntable_t **txns, const char
 	if (local)
 		txn->data = strdup(data);
 	else {
-		/* Get the data from our local bitcoind as a way of confirming it
+		/* Get the data from our local cheetahcoind as a way of confirming it
 		 * already knows about this transaction. */
 		txn->data = generator_get_txn(ckp, hash);
 		if (!txn->data) {
-			/* If our local bitcoind hasn't seen this transaction,
+			/* If our local cheetahcoind hasn't seen this transaction,
 			 * submit it for mempools to be ~synchronised */
 			submit_transaction(ckp, data);
 			txn->data = strdup(data);
@@ -1161,7 +1161,7 @@ static void update_txns(ckpool_t *ckp, sdata_t *sdata, txntable_t *txns, bool lo
 	} else
 		json_decref(txn_array);
 
-	/* Submit transactions to bitcoind again when we're purging them in
+	/* Submit transactions to cheetahcoind again when we're purging them in
 	 * case they've been removed from its mempool as well and we need them
 	 * again in the future for a remote workinfo that hasn't forgotten
 	 * about them. */
@@ -1370,7 +1370,7 @@ retry:
 		gbt_witness_data(wb, txn_array);
 		// Verify against the pre-calculated value if it exists. Skip the size/OP_RETURN bytes.
 		if (wb->insert_witness && safecmp(witnessdata_check + 4, wb->witnessdata) != 0)
-			LOGERR("Witness from btcd: %s. Calculated Witness: %s", witnessdata_check + 4, wb->witnessdata);
+			LOGERR("Witness from cheetahcoind: %s. Calculated Witness: %s", witnessdata_check + 4, wb->witnessdata);
 	}
 
 	generate_coinbase(ckp, wb);
@@ -1399,7 +1399,7 @@ out:
 	cksem_post(&sdata->update_sem);
 
 	/* Send a ping to miners if we fail to get a base to keep them
-	 * connected while bitcoind recovers(?) */
+	 * connected while cheetahcoind recovers(?) */
 	if (unlikely(!ret)) {
 		LOGINFO("Broadcast ping due to failed stratum base update");
 		broadcast_ping(sdata);
@@ -1520,7 +1520,7 @@ static bool rebuild_txns(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 
 		if (likely(txn_val))
 			continue;
-		/* See if we can find it in our local bitcoind */
+		/* See if we can find it in our local cheetahcoind */
 		data = generator_get_txn(ckp, hash);
 		if (!data) {
 			txn_val = json_string(hash);
@@ -7772,7 +7772,7 @@ static void parse_instance_msg(ckpool_t *ckp, sdata_t *sdata, smsg_t *msg, strat
 	while (unlikely(!ckp->proxy && !sdata->current_workbase)) {
 		cksleep_ms(100);
 		if (!(++delays % 50))
-			LOGWARNING("%d Second delay waiting for bitcoind at startup", delays / 10);
+			LOGWARNING("%d Second delay waiting for cheetahcoind at startup", delays / 10);
 	}
 	parse_method(ckp, sdata, client, client_id, id_val, method, params);
 }
@@ -8996,7 +8996,7 @@ void *stratifier(void *arg)
 
 	if (!ckp->proxy) {
 		if (!generator_checkaddr(ckp, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
-			LOGEMERG("Fatal: btcaddress invalid according to bitcoind");
+			LOGEMERG("Fatal: btcaddress invalid according to cheetahcoind");
 			goto out;
 		}
 
@@ -9008,17 +9008,17 @@ void *stratifier(void *arg)
 		if (generator_checkaddr(ckp, ckp->donaddress, &ckp->donscript, &ckp->donsegwit)) {
 			ckp->donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC donation address valid %s", ckp->donaddress);
+			LOGNOTICE("CHTA donation address valid %s", ckp->donaddress);
 		} else if (generator_checkaddr(ckp, ckp->tndonaddress, &ckp->donscript, &ckp->donsegwit)) {
 			ckp->donaddress = ckp->tndonaddress;
 			ckp->donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC testnet donation address valid %s", ckp->donaddress);
+			LOGNOTICE("CHTA testnet donation address valid %s", ckp->donaddress);
 		} else if (generator_checkaddr(ckp, ckp->rtdonaddress, &ckp->donscript, &ckp->donsegwit)) {
 			ckp->donaddress = ckp->rtdonaddress;
 			ckp->donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckp->donaddress, ckp->donscript, ckp->donsegwit);
-			LOGNOTICE("BTC regtest donation address valid %s", ckp->donaddress);
+			LOGNOTICE("CHTA regtest donation address valid %s", ckp->donaddress);
 		} else
 			LOGNOTICE("No valid donation address found");
 	}

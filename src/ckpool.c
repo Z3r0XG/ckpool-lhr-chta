@@ -750,7 +750,7 @@ static const char *rpc_method(const char *rpc_req)
 	return rpc_req;
 }
 
-/* All of these calls are made to bitcoind which prefers open/close instead
+/* All of these calls are made to cheetahcoind which prefers open/close instead
  * of persistent connections so cs->fd is always invalid. */
 static json_t *_json_rpc_call(connsock_t *cs, const char *rpc_req, const bool info_only)
 {
@@ -1754,7 +1754,7 @@ int main(int argc, char **argv)
 		else if (ckp.proxy)
 			ckp.name = "ckproxy";
 		else
-			ckp.name = "ckpool";
+			ckp.name = "ckpool-lhr-chta";
 	}
 	snprintf(buf, 15, "%s", ckp.name);
 	prctl(PR_SET_NAME, buf, 0, 0, 0);
@@ -1798,27 +1798,26 @@ int main(int argc, char **argv)
 	}
 	for (i = 0; i < ckp.btcds; i++) {
 		if (!ckp.btcdurl[i])
-			ckp.btcdurl[i] = strdup("localhost:8332");
+			ckp.btcdurl[i] = strdup("localhost:8536");
 		if (!ckp.btcdauth[i])
 			ckp.btcdauth[i] = strdup("user");
 		if (!ckp.btcdpass[i])
 			ckp.btcdpass[i] = strdup("pass");
 	}
+	/* Replace with a valid CHTA mainnet address if donation > 0 is configured */
 	if (!ckp.donaddress)
-		ckp.donaddress = "bc1q8qkesw5kyplv7hdxyseqls5m78w5tqdfd40lf5";
+		ckp.donaddress = "CVXL3EHkrH8xWsv4ECtwWxJqzHQG9KujNq";
 	if (ckp.donation < 0.1)
 		ckp.donation = 0;
 	else if (ckp.donation > 99.9)
 		ckp.donation = 99.9;
-	/* Donations on testnet are meaningless but required for complete
-	 * testing. Testnet and regtest addresses */
-	ckp.tndonaddress = "tb1q5fyv7tue73y4zxezh2c685qpwx0cfngfxlrgxh";
-	ckp.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
+	ckp.tndonaddress = "chtaTNdonationAddrReplaceMe";
+	ckp.rtdonaddress = "chtaRTdonationAddrReplaceMe";
 
 	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy)
-		quit(0, "Non-solo mining must have a btcaddress in config, aborting!");
+		quit(0, "Non-solo mining must have a chtaaddress in config, aborting!");
 	if (!ckp.blockpoll)
-		ckp.blockpoll = 100;
+		ckp.blockpoll = 5000; /* CHTA ~2min blocks; 5s poll catches new block within ~4% of block time */
 	if (!ckp.nonce1length)
 		ckp.nonce1length = 4;
 	else if (ckp.nonce1length < 2 || ckp.nonce1length > 8)
@@ -1862,7 +1861,7 @@ int main(int argc, char **argv)
 	if (ckp.redirector && !ckp.redirecturls)
 		quit(0, "No redirect entries found in config file %s", ckp.config);
 	if (!ckp.zmqblock)
-		ckp.zmqblock = "tcp://127.0.0.1:28332";
+		ckp.zmqblock = "tcp://127.0.0.1:28333";
 
 	/* Create the log directory */
 	trail_slash(&ckp.logdir);

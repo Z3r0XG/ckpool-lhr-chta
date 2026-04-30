@@ -1,7 +1,7 @@
 {
 "btcd" : [
 	{
-		"url" : "localhost:8332",
+		"url" : "localhost:8536",
 		"auth" : "user",
 		"pass" : "pass",
 		"notify" : true

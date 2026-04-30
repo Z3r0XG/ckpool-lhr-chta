@@ -268,7 +268,7 @@ static bool server_alive(ckpool_t *ckp, server_instance_t *si, bool pinging)
 	}
 
 	if (!ckp->node && !validate_address(cs, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
-		LOGWARNING("Invalid btcaddress: %s !", ckp->btcaddress);
+		LOGWARNING("Invalid chtaaddress: %s !", ckp->btcaddress);
 		goto out;
 	}
 	si->alive = cs->alive = ret = true;
@@ -286,7 +286,7 @@ static server_instance_t *live_server(ckpool_t *ckp, gdata_t *gdata)
 	connsock_t *cs;
 	int i;
 
-	LOGDEBUG("Attempting to connect to bitcoind");
+	LOGDEBUG("Attempting to connect to cheetahcoind");
 retry:
 	/* First find a server that is already flagged alive if possible
 	 * without blocking on server_alive() */
@@ -309,7 +309,7 @@ retry:
 			goto living;
 		}
 	}
-	LOGWARNING("CRITICAL: No bitcoinds active!");
+	LOGWARNING("CRITICAL: No cheetahcoinds active!");
 	sleep(5);
 	goto retry;
 living:
@@ -415,9 +415,9 @@ reconnect:
 
 	cs = &si->cs;
 	if (!old_si)
-		LOGWARNING("Connected to bitcoind: %s:%s", cs->url, cs->port);
+		LOGWARNING("Connected to cheetahcoind: %s:%s", cs->url, cs->port);
 	else if (si != old_si)
-		LOGWARNING("Failed over to bitcoind: %s:%s", cs->url, cs->port);
+		LOGWARNING("Failed over to cheetahcoind: %s:%s", cs->url, cs->port);
 
 retry:
 	clear_unix_msg(&umsg);
@@ -427,7 +427,7 @@ retry:
 	} while (!umsg);
 
 	if (unlikely(!si->alive)) {
-		LOGWARNING("%s:%s Bitcoind socket invalidated, will attempt failover", cs->url, cs->port);
+		LOGWARNING("%s:%s Cheetahcoind socket invalidated, will attempt failover", cs->url, cs->port);
 		goto reconnect;
 	}
 
@@ -3189,9 +3189,9 @@ reconnect:
 			goto out;
 		cs = &si->cs;
 		if (!old_si)
-			LOGWARNING("Connected to bitcoind: %s:%s", cs->url, cs->port);
+			LOGWARNING("Connected to cheetahcoind: %s:%s", cs->url, cs->port);
 		else if (si != old_si)
-			LOGWARNING("Failed over to bitcoind: %s:%s", cs->url, cs->port);
+			LOGWARNING("Failed over to cheetahcoind: %s:%s", cs->url, cs->port);
 	}
 
 	/* This does not necessarily mean we reconnect, but a change has

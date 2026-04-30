@@ -1,4 +1,4 @@
-AC_INIT([ckpool-lhr],[1.0.0],[https://github.com/Z3r0XG/ckpool-lhr/issues])
+AC_INIT([ckpool-lhr],[1.0.0],[https://github.com/Z3r0XG/ckpool-lhr-chta/issues])
 
 AC_CANONICAL_TARGET
 AC_CONFIG_MACRO_DIR([m4])
