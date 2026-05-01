@@ -46,6 +46,11 @@ config.h
 /src/ckpmsg
 /src/notifier
 
+# Jansson build artifacts
+src/jansson-2.14/*.pc
+src/jansson-2.14/jansson_private_config.h
+src/jansson-2.14/src/jansson_config.h
+
 # Jansson test artifacts
 src/jansson-2.14/scripts/*.log
 
