@@ -977,7 +977,7 @@ static void broadcast_ping(sdata_t *sdata);
 #define REFCOUNT_LOCAL		10
 #define REFCOUNT_RETURNED	5
 
-/* Submit the transactions in node/remote mode so the local btcd has all the
+/* Submit the transactions in node/remote mode so the local cheetahcoind has all the
  * transactions that will go into the next blocksolve. */
 static void submit_transaction(ckpool_t *ckp, const char *hash)
 {
@@ -8996,7 +8996,7 @@ void *stratifier(void *arg)
 
 	if (!ckp->proxy) {
 		if (!generator_checkaddr(ckp, ckp->btcaddress, &ckp->script, &ckp->segwit)) {
-			LOGEMERG("Fatal: btcaddress invalid according to cheetahcoind");
+			LOGEMERG("Fatal: chtaaddress invalid according to cheetahcoind");
 			goto out;
 		}
 
