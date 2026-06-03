@@ -16,7 +16,7 @@
 #include "libckpool.h"
 
 /* truediffone constant - same as in libckpool.c */
-static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
+static const double truediffone = 26959946667150639794667015087019630673637144422540572481103610249215.0;
 
 /* Test le256todouble() - little-endian 256-bit to double conversion */
 static void test_le256todouble_basic(void)

@@ -29,6 +29,8 @@ Makefile.in
 # Generated headers
 config.h.in
 config.h
+jansson_private_config.h.in
+jansson_private_config.h
 
 # Compiled object files and libraries
 **/*.o
@@ -45,6 +47,10 @@ config.h
 /src/ckpool
 /src/ckpmsg
 /src/notifier
+
+# Autotools test runner (generated)
+test-driver
+src/jansson-2.14/test-driver
 
 # Jansson build artifacts
 src/jansson-2.14/*.pc
