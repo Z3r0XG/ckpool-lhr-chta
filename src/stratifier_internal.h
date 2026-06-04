@@ -19,6 +19,15 @@ typedef struct stratifier_data sdata_t;
 typedef struct proxy_base proxy_t;
 typedef struct ckpool_instance ckpool_t;
 
+/* Share fingerprint stored in the dedupe hashtable, keyed by share hash. */
+struct share {
+	UT_hash_handle hh;
+	uchar hash[32];
+	int64_t workbase_id;
+};
+
+typedef struct share share_t;
+
 /* Struct definitions used by stratifier and tests */
 
 /* Combined data from users */
@@ -201,5 +210,108 @@ struct stratum_instance {
 	bool trusted; /* Is this a trusted remote server */
 	bool remote; /* Is this a remote client on a trusted remote server */
 };
+
+/* -------------------------------------------------------------------------
+ * Pure best_diff / best_ever update logic.
+ *
+ * Extracted from check_best_diff() so that unit tests can exercise the same
+ * code path against the real struct types without pulling in the full
+ * stratifier (sdata_t, mutexes, stratum_send_message).
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+	bool best_ever;        /* sdiff is a new best_ever for user or worker */
+	bool best_ever_user;   /* sdiff is a new best_ever for this user */
+	bool best_ever_worker; /* sdiff is a new best_ever for this worker */
+	bool best_worker;      /* sdiff is a new best_diff for this worker */
+	bool best_user;        /* sdiff is a new best_diff for this user */
+} best_diff_result_t;
+
+/* Update best_ever unconditionally (gated by >), and best_diff when guard_round
+ * is false OR sdiff < network_diff * 0.999.
+ *
+ * guard_round=false (local paths): always update best_diff — the caller owns
+ *   the ordering; for confirmed solves check_best_diff runs before
+ *   block_solve()→reset_bestshares(), so logging captures the solve diff.
+ *
+ * guard_round=true (remote SM_SHARE path only): SM_BLOCK fires reset_bestshares()
+ *   before SM_SHARE arrives, so the round is already fresh; we must NOT write
+ *   the solve diff into best_diff or it poisons the new round. */
+static inline best_diff_result_t
+update_best_diff(user_instance_t *user, worker_instance_t *worker,
+		 double sdiff, double network_diff, bool guard_round)
+{
+	best_diff_result_t r = {false, false, false, false, false};
+
+	if (sdiff > user->best_ever) {
+		user->best_ever = sdiff;
+		r.best_ever = true;
+		r.best_ever_user = true;
+	}
+	if (sdiff > worker->best_ever) {
+		worker->best_ever = sdiff;
+		r.best_ever = true;
+		r.best_ever_worker = true;
+	}
+
+	if (!guard_round || sdiff < network_diff * 0.999) {
+		if (sdiff > worker->best_diff) { worker->best_diff = sdiff; r.best_worker = true; }
+		if (sdiff > user->best_diff)   { user->best_diff   = sdiff; r.best_user   = true; }
+	}
+	return r;
+}
+
+/* Per-client gate: returns true when sdiff sets a new session best.
+ * Confirmed solves are handled before reset_bestshares() in test_blocksolve()
+ * and never reach this path, so no network_diff guard is needed here.
+ * The persistent-round guard (sdiff < network_diff * 0.999, matching test_blocksolve's
+ * 0.999 tolerance to handle floating-point rounding) lives in update_best_diff()
+ * which protects user->best_diff and worker->best_diff written to disk. */
+static inline bool
+client_gate_update(stratum_instance_t *client, double sdiff)
+{
+	if (sdiff > client->best_diff) {
+		client->best_diff = sdiff;
+		return true;
+	}
+	return false;
+}
+
+/* Look up a share fingerprint without recording it. Pure check, no side
+ * effects: lets the block-solve path detect a duplicate solve share before
+ * resubmitting the block and re-triggering reset_bestshares(). */
+static inline bool
+share_exists(mutex_t *lock, share_t **table, const uchar *hash)
+{
+	share_t *match = NULL;
+
+	mutex_lock(lock);
+	HASH_FIND(hh, *table, hash, 32, match);
+	mutex_unlock(lock);
+
+	return match != NULL;
+}
+
+/* Record a solved share's fingerprint so a later duplicate is caught by
+ * share_exists(). The block-solve path skips normal share accounting, so the
+ * fingerprint is recorded here on a confirmed block submission only. Does not
+ * touch shares_generated — the solve share is not counted as a normal share. */
+static inline void
+record_solve_share(mutex_t *lock, share_t **table, const uchar *hash, const int64_t wb_id)
+{
+	share_t *share = ckzalloc(sizeof(share_t)), *match = NULL;
+
+	memcpy(share->hash, hash, 32);
+	share->workbase_id = wb_id;
+
+	mutex_lock(lock);
+	HASH_FIND(hh, *table, hash, 32, match);
+	if (likely(!match))
+		HASH_ADD(hh, *table, hash, 32, share);
+	mutex_unlock(lock);
+
+	if (unlikely(match))
+		dealloc(share);
+}
 
 #endif /* STRATIFIER_INTERNAL_H */

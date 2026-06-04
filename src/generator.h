@@ -22,8 +22,7 @@ int generator_getbest(ckpool_t *ckp, char *hash);
 bool generator_checkaddr(ckpool_t *ckp, const char *addr, bool *script, bool *segwit);
 bool generator_checktxn(const ckpool_t *ckp, const char *txn, json_t **val);
 char *generator_get_txn(ckpool_t *ckp, const char *hash);
-bool generator_submitblock(ckpool_t *ckp, const char *buf);
-void generator_preciousblock(ckpool_t *ckp, const char *hash);
+bool generator_submitblock(ckpool_t *ckp, const char *buf, int height, const char *workername);
 bool generator_get_blockhash(ckpool_t *ckp, int height, char *hash);
 void *generator(void *arg);
 

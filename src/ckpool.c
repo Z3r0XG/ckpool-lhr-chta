@@ -1528,7 +1528,7 @@ static void parse_config(ckpool_t *ckp)
 	json_get_double(&ckp->startdiff, json_conf, "startdiff");
 	json_get_double(&ckp->highdiff, json_conf, "highdiff");
 	json_get_double(&ckp->maxdiff, json_conf, "maxdiff");
-	json_get_bool(&ckp->allow_low_diff, json_conf, "allow_low_diff");
+
 	json_get_string(&ckp->logdir, json_conf, "logdir");
 	json_get_int(&ckp->maxclients, json_conf, "maxclients");
 	arr_val = json_object_get(json_conf, "proxy");
@@ -1829,7 +1829,7 @@ int main(int argc, char **argv)
 	} else if (ckp.nonce2length < 2 || ckp.nonce2length > 8)
 		quit(0, "Invalid nonce2length %d specified, must be 2~8", ckp.nonce2length);
 	if (!ckp.update_interval)
-		ckp.update_interval = 30;
+		ckp.update_interval = 5; /* CHTA randomSpike: refresh GBT frequently to escape spike windows */
 
 	/* Validate mindiff is sane */
 	if (!validate_mindiff(&ckp.mindiff))

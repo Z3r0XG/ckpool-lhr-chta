@@ -346,7 +346,7 @@ static void clear_unix_msg(unix_msg_t **umsg)
 	}
 }
 
-bool generator_submitblock(ckpool_t *ckp, const char *buf)
+bool generator_submitblock(ckpool_t *ckp, const char *buf, int height, const char *workername)
 {
 	gdata_t *gdata = ckp->gdata;
 	server_instance_t *si;
@@ -360,22 +360,13 @@ bool generator_submitblock(ckpool_t *ckp, const char *buf)
 		cksleep_ms(10);
 	}
 	cs = &si->cs;
-	LOGNOTICE("Submitting block data!");
-	return submit_block(cs, buf);
-}
-
-void generator_preciousblock(ckpool_t *ckp, const char *hash)
-{
-	gdata_t *gdata = ckp->gdata;
-	server_instance_t *si;
-	connsock_t *cs;
-
-	if (unlikely(!(si = gdata->current_si))) {
-		LOGWARNING("No live current server in generator_get_blockhash");
-		return;
-	}
-	cs = &si->cs;
-	precious_block(cs, hash);
+	if (workername)
+		LOGNOTICE("Height: %d, User: %s - Submitting block data!", height, workername);
+	else if (height >= 0)
+		LOGNOTICE("Height: %d - Submitting block data!", height);
+	else
+		LOGNOTICE("Submitting block data!");
+	return submit_block(cs, buf, height, workername);
 }
 
 bool generator_get_blockhash(ckpool_t *ckp, int height, char *hash)
@@ -483,7 +474,7 @@ retry:
 		bool ret;
 
 		LOGNOTICE("Submitting block data!");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = submit_block(cs, buf + 12 + 64 + 1, -1, NULL);
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckp->stratifier, blockmsg);
@@ -3244,7 +3235,7 @@ retry:
 		bool ret;
 
 		LOGNOTICE("Submitting likely block solve share from upstream pool");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = submit_block(cs, buf + 12 + 64 + 1, -1, NULL);
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckp->stratifier, blockmsg);

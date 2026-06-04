@@ -149,14 +149,6 @@ struct stratum_instance;
 
 /* Struct definitions now in stratifier_internal.h (included via worker_ua.h) */
 
-struct share {
-	UT_hash_handle hh;
-	uchar hash[32];
-	int64_t workbase_id;
-};
-
-typedef struct share share_t;
-
 struct proxy_base {
 	UT_hash_handle hh;
 	UT_hash_handle sh; /* For subproxy hashlist */
@@ -284,6 +276,7 @@ struct stratifier_data {
 	int session_id;
 	char lasthash[68];
 	char lastswaphash[68];
+	char cheetah_bits[12];     /* compact nBits of CHTA 0.0025 difficulty, learned from chain */
 
 	ckmsgq_t *updateq;	// Generator base work updates
 	ckmsgq_t *ssends;	// Stratum sends
@@ -880,6 +873,16 @@ static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
 
 /* Add a new workbase to the table of workbases. Sdata is the global data in
  * pool mode but unique to each subproxy in proxy mode */
+/* Derive network_diff from the nBits field in the block header.  The nBits
+ * field sits at byte offset 72 of the 80-byte Bitcoin-family packed header.
+ * CHTA legitimately uses sub-1 difficulties (0.0025 cheetah blocks) so the
+ * value is never clamped; any sub-1 result marks a cheetah workbase. */
+static void wb_set_network_diff(workbase_t *wb)
+{
+	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+	wb->cheetah_mode = (wb->network_diff > 0 && wb->network_diff < 1.0);
+}
+
 static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_block)
 {
 	sdata_t *ckp_sdata = ckp->sdata;
@@ -891,13 +894,82 @@ static void add_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bl
 	ts_realtime(&wb->gentime);
 	/* Stats network_diff is not protected by lock but is not a critical
 	 * value */
-	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
-	/* Allow sub-1.0 network diff only when explicitly enabled (for regtest testing) */
-	if (!ckp->allow_low_diff && wb->network_diff < 1)
-		wb->network_diff = 1;
+	wb_set_network_diff(wb);
+
+	/* CHTA cheetah-mode override.
+	 *
+	 * CHTA's randomSpike DAA grants 0.0025 difficulty (nCheetah) to any
+	 * block whose nTime exceeds its parent's nTime by >240s. Other miners
+	 * exploit this by setting nTime = parent_nTime + 241. The node caps
+	 * block timestamps at adjusted_time + 30s, so this is only legal once
+	 * real time has caught up to parent_nTime + ~211s.
+	 *
+	 * ckpool's GBT, using real curtime, almost never sees 0.0025 naturally
+	 * (the chain rarely stalls a full 240s), so we replicate the trick:
+	 * learn the cheetah nBits from observed easy blocks, then when the
+	 * parent is old enough, override nTime and nBit to mine an easy block. */
+	if (!ckp->proxy && wb->prev_block_bits[0]) {
+		uchar pbits_bin[4] = {};
+		double parent_diff;
+
+		hex2bin(pbits_bin, wb->prev_block_bits, 4);
+		parent_diff = diff_from_nbits((char *)pbits_bin);
+		/* Cache the cheetah nBits whenever the parent was an easy block */
+		if (parent_diff > 0 && parent_diff < 1.0 &&
+		    safecmp(sdata->cheetah_bits, wb->prev_block_bits)) {
+			snprintf(sdata->cheetah_bits, 9, "%s", wb->prev_block_bits);
+			LOGDEBUG("CHTA: learned cheetah nBits %s (diff=%.6f) from chain",
+				 sdata->cheetah_bits, parent_diff);
+		}
+	}
+
+	/* Apply the override when not already a cheetah workbase, we know the
+	 * cheetah nBits, and the parent is old enough that parent+241 is a
+	 * legal future timestamp. The node rejects nTime > adjusted_time + 30,
+	 * and nTime = parent+241, so the minimum legal delta is 211. We use 215
+	 * for a 4s safety margin (clock skew / ntime rolling) while still firing
+	 * earlier than competing cheetah miners who tend to wait until ~225. */
+	if (!ckp->proxy && !wb->cheetah_mode && sdata->cheetah_bits[0] &&
+	    wb->prev_block_time) {
+		time_t now = time(NULL);
+		uint32_t cheetah_ntime = wb->prev_block_time + 241;
+
+		if (now >= (time_t)wb->prev_block_time + 215) {
+			char header[270] = {};
+
+			snprintf(wb->ntime, 9, "%08x", cheetah_ntime);
+			wb->ntime32 = cheetah_ntime;
+			snprintf(wb->nbit, 9, "%s", sdata->cheetah_bits);
+			snprintf(header, 270, "%s%s%s%s%s%s%s",
+				 wb->bbversion, wb->prevhash,
+				 "0000000000000000000000000000000000000000000000000000000000000000",
+				 wb->ntime, wb->nbit,
+				 "00000000", workpadding);
+			header[224] = 0;
+			hex2bin(wb->headerbin, header, 112);
+			wb_set_network_diff(wb); /* recomputes diff + sets cheetah_mode */
+			LOGDEBUG("CHTA cheetah override: ntime=%08x nbit=%s diff=%.6f "
+				 "(parent_time=%u now=%ld delta=%lds)",
+				 cheetah_ntime, wb->nbit, wb->network_diff,
+				 wb->prev_block_time, (long)now,
+				 (long)(now - (time_t)wb->prev_block_time));
+		}
+	}
+
 	stats->network_diff = wb->network_diff;
-	if (stats->network_diff != old_diff)
-		LOGWARNING("Network diff set to %.1f", stats->network_diff);
+	if (stats->network_diff != old_diff) {
+		LOGWARNING("Network diff set to %.4f", stats->network_diff);
+		/* CHTA randomSpike: if network_diff spiked dramatically vs the
+		 * previous value, the GBT timestamp landed in a spike window.
+		 * Schedule a re-fetch 3 seconds from now so we call GBT at a
+		 * different second and likely escape the spike. */
+		if (old_diff > 0 && wb->network_diff > old_diff * 100 &&
+				wb->network_diff > 1e9) {
+			LOGDEBUG("Spike detected (%.1f -> %.1f), re-fetching GBT in 3s",
+				 old_diff, wb->network_diff);
+			sdata->update_time = time(NULL) + 3 - ckp->update_interval;
+		}
+	}
 	len = strlen(ckp->logdir) + 8 + 1 + 16 + 1;
 	wb->logdir = ckzalloc(len);
 
@@ -1593,6 +1665,7 @@ static void add_remote_base(ckpool_t *ckp, sdata_t *sdata, workbase_t *wb)
 	json_t *val;
 
 	ts_realtime(&wb->gentime);
+	wb_set_network_diff(wb);
 
 	ck_wlock(&sdata->workbase_lock);
 	sdata->workbases_generated++;
@@ -1936,19 +2009,19 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 }
 
 /* Submit block data locally, absorbing and freeing gbt_block */
-static bool local_block_submit(ckpool_t *ckp, char *gbt_block, const uchar *flip32, int height)
+static bool local_block_submit(ckpool_t *ckp, char *gbt_block, const uchar *flip32, int height, const char *workername)
 {
-	bool ret = generator_submitblock(ckp, gbt_block);
+	bool ret = generator_submitblock(ckp, gbt_block, height, workername);
 	char heighthash[68] = {}, rhash[68] = {};
 	uchar swap256[32];
 
 	free(gbt_block);
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
-	generator_preciousblock(ckp, rhash);
 
-	/* Check failures that may be inconclusive but were submitted via other
-	 * means or accepted due to precious block call. */
+	/* Check failures that may be inconclusive — submitblock can return
+	 * failure even when the block was accepted (e.g. duplicate submission).
+	 * Verify by querying the active-chain block hash at this height. */
 	if (!ret) {
 		/* If the block is accepted locally, it means we may have
 		 * displaced a known block, and are now working on this fork.
@@ -2064,8 +2137,6 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 		LOGINFO("No version mask in node method block");
 	}
 
-	LOGWARNING("Possible upstream block solve diff %lf !", diff);
-
 	ts_realtime(&ts_now);
 	sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
 
@@ -2074,6 +2145,7 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 		LOGWARNING("Failed to find workbase with jobid %"PRId64" in node method block", id);
 		goto out;
 	}
+	LOGWARNING("Height: %d - Possible upstream block solve diff %lf !", wb->height, diff);
 
 	/* Get parameters if upstream pool supports them with new format */
 	json_get_string(&coinbasehex, val, "coinbasehex");
@@ -2100,9 +2172,9 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 
 	/* Now we have enough to assemble a block */
 	gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
-	ret = local_block_submit(ckp, gbt_block, flip32, wb->height);
+	ret = local_block_submit(ckp, gbt_block, flip32, wb->height, NULL);
 
-	JSON_CPACK(bval, "{si,ss,ss,sI,ss,ss,si,ss,sI,sf,ss,ss,ss,ss}",
+	JSON_CPACK(bval, "{si,ss,ss,sI,ss,ss,si,ss,sI,sf,sf,ss,ss,ss,ss}",
 			 "height", wb->height,
 			 "blockhash", blockhash,
 			 "confirmed", "n",
@@ -2113,6 +2185,7 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 			 "nonce", nonce,
 			 "reward", wb->coinbasevalue,
 			 "diff", diff,
+			 "network_diff", wb->network_diff,
 			 "createdate", cdfield,
 			 "createby", "code",
 			 "createcode", __func__,
@@ -3676,17 +3749,28 @@ static void remap_workinfo_id(sdata_t *sdata, json_t *val, const int64_t client_
 	json_set_int64(val, "workinfoid", mapped_id);
 }
 
-static void block_share_summary(sdata_t *sdata)
+static void block_share_summary(sdata_t *sdata, int height, const char *username,
+					 const char *workername, double network_diff)
 {
 	double bdiff, sdiff;
 
-	if (unlikely(!sdata->current_workbase || !sdata->current_workbase->network_diff))
+	if (unlikely(!network_diff))
 		return;
 
 	sdiff = sdata->stats.accounted_diff_shares;
-	bdiff = sdiff / sdata->current_workbase->network_diff * 100;
-	LOGWARNING("Block solved after %.0lf shares at %.1f%% diff",
-		   sdiff, bdiff);
+	bdiff = sdiff / network_diff * 100;
+	if (username && workername)
+		LOGWARNING("Height: %d, User: %s.%s - Block solved after %.0lf shares at %.1f%% diff",
+			   height, username, workername, sdiff, bdiff);
+	else if (workername)
+		LOGWARNING("Height: %d, User: %s - Block solved after %.0lf shares at %.1f%% diff",
+			   height, workername, sdiff, bdiff);
+	else if (username)
+		LOGWARNING("Height: %d, User: %s - Block solved after %.0lf shares at %.1f%% diff",
+			   height, username, sdiff, bdiff);
+	else
+		LOGWARNING("Height: %d - Block solved after %.0lf shares at %.1f%% diff",
+			   height, sdiff, bdiff);
 }
 
 static void block_solve(ckpool_t *ckp, json_t *val)
@@ -3694,7 +3778,7 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 	char *msg, *workername = NULL;
 	sdata_t *sdata = ckp->sdata;
 	char cdfield[64];
-	double diff = 0;
+	double diff = 0, network_diff = 0;
 	int height = 0;
 	ts_t ts_now;
 
@@ -3706,21 +3790,32 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 	json_set_string(val, "createcode", __func__);
 	json_get_int(&height, val, "height");
 	json_get_double(&diff, val, "diff");
+	json_get_double(&network_diff, val, "network_diff");
 	json_get_string(&workername, val, "workername");
 
 	if (!workername) {
 		ASPRINTF(&msg, "Block solved by %s!", ckp->name);
-		LOGWARNING("Solved and confirmed block!");
-	} else {
+		LOGWARNING("Height: %d - Solved and confirmed block!", height);
+		stratum_broadcast_message(sdata, msg);
+		free(msg);
+		free(workername);
+		block_share_summary(sdata, height, NULL, NULL, network_diff);
+		reset_bestshares(sdata);
+		return;
+	}
+
+	{
 		json_t *user_val, *worker_val;
 		worker_instance_t *worker;
 		user_instance_t *user;
 		char *s;
 
 		ASPRINTF(&msg, "Block %d solved by %s @ %s!", height, workername, ckp->name);
-		LOGWARNING("Solved and confirmed block %d by %s", height, workername);
 		user = user_by_workername(sdata, workername);
 		worker = get_worker(sdata, user, workername);
+		LOGWARNING("Height: %d, User: %s - Solved and confirmed block",
+			   height,
+			   workername);
 
 		ck_rlock(&sdata->instance_lock);
 		user_val = user_stats(user);
@@ -3735,14 +3830,13 @@ static void block_solve(ckpool_t *ckp, json_t *val)
 		json_decref(worker_val);
 		LOGWARNING("Worker %s:%s", workername, s);
 		dealloc(s);
+
+		stratum_broadcast_message(sdata, msg);
+		free(msg);
+		block_share_summary(sdata, height, NULL, workername, network_diff);
+		reset_bestshares(sdata);
+		free(workername);
 	}
-	stratum_broadcast_message(sdata, msg);
-	free(msg);
-
-	free(workername);
-
-	block_share_summary(sdata);
-	reset_bestshares(sdata);
 }
 
 static void block_reject(json_t *val)
@@ -4634,6 +4728,46 @@ static void *blockupdate(void *arg)
 	return NULL;
 }
 
+/* CHTA: poll GBT aggressively once block-age enters the 220-260s window so
+ * we catch the 0.0025 cheetah difficulty the moment it opens. */
+static void *cheetahwatch(void *arg)
+{
+	ckpool_t *ckp = (ckpool_t *)arg;
+	sdata_t *sdata = ckp->sdata;
+
+	pthread_detach(pthread_self());
+	rename_proc("cheetahwatch");
+
+	while (42) {
+		uint32_t parent_time = 0;
+		bool already_cheetah = false;
+		time_t now = time(NULL);
+		long age = 0;
+
+		ck_rlock(&sdata->workbase_lock);
+		if (sdata->current_workbase) {
+			parent_time = sdata->current_workbase->prev_block_time;
+			already_cheetah = sdata->current_workbase->cheetah_mode;
+		}
+		ck_runlock(&sdata->workbase_lock);
+
+		if (parent_time)
+			age = (long)now - (long)parent_time;
+
+		/* The override becomes legal at age >= 215 (see add_base). Poll
+		 * GBT every second from age 209 so we apply and push the cheetah
+		 * workbase to miners the instant it's legal. */
+		if (!ckp->proxy && !already_cheetah && parent_time && age >= 209) {
+			LOGDEBUG("Cheetahwatch: parent age %lds, aggressive GBT poll", age);
+			update_base(sdata, GEN_NORMAL);
+			cksleep_ms(1000);
+		} else {
+			cksleep_ms(2000);
+		}
+	}
+	return NULL;
+}
+
 /* Enter holding workbase_lock and client a ref count. */
 static void __fill_enonce1data(const workbase_t *wb, stratum_instance_t *client)
 {
@@ -4700,6 +4834,9 @@ static bool new_enonce1(ckpool_t *ckp, sdata_t *ckp_sdata, sdata_t *sdata, strat
 }
 
 static void stratum_send_message(sdata_t *sdata, const stratum_instance_t *client, const char *msg);
+static void check_best_diff(sdata_t *sdata, user_instance_t *user, worker_instance_t *worker,
+			    const double sdiff, stratum_instance_t *client, double network_diff,
+			    bool guard_round);
 
 /* Need to hold sdata->proxy_lock */
 static proxy_t *__best_subproxy(proxy_t *proxy)
@@ -5724,10 +5861,15 @@ static void stratum_send_message(sdata_t *sdata, const stratum_instance_t *clien
 	json_t *json_msg;
 
 	/* Only send messages to whitelisted clients */
-	if (!client->messages)
+	if (!client->messages) {
+		LOGDEBUG("stratum_send_message: skipping client.show_message for client %s because messages are disabled",
+			client->identity);
 		return;
+	}
 	JSON_CPACK(json_msg, "{sosss[s]}", "id", json_null(), "method", "client.show_message",
 			     "params", msg);
+	LOGDEBUG("stratum_send_message: queued client.show_message for client %s: %s",
+			client->identity, msg);
 	stratum_add_send(sdata, json_msg, client->id, SM_MSG);
 }
 
@@ -5750,6 +5892,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	double tdiff, bdiff, dsps, drr, network_diff, bias, optimal;
 	user_instance_t *user = client->user_instance;
 	int64_t next_blockid, current_blockid;
+	bool cheetah_mode = false;
 	double mindiff;
 	tv_t now_t;
 
@@ -5780,6 +5923,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 		network_diff = sdata->current_workbase->diff;
 	else
 		network_diff = sdata->current_workbase->network_diff;
+	cheetah_mode = sdata->current_workbase->cheetah_mode;
 	ck_runlock(&sdata->workbase_lock);
 
 	if (unlikely(!client->first_share.tv_sec)) {
@@ -5847,8 +5991,11 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	}
 	drr = dsps / (double)client->diff;
 
-	/* Optimal rate product is 0.3, allow some hysteresis. */
-	if (drr > 0.15 && drr < 0.4)
+	/* Optimal rate product is 1.0 (≈1 share/sec), allow some hysteresis.
+	 * CHTA uses a faster share cadence than stock (3.33s) so that when a
+	 * cheetah window opens, a miner's next share — which wins the 0.0025
+	 * block — lands within ~1s instead of up to ~3s, improving the race. */
+	if (drr > 0.5 && drr < 1.33)
 		return;
 
 	/* Respect miner's hint as a floor. Two sources, in priority order:
@@ -5859,7 +6006,7 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 		mindiff = client->suggest_diff;
 	else
 		mindiff = worker->mindiff;
-	optimal = dsps * 3.33;
+	optimal = dsps * 1.0;
 
 	/* Clamp to mindiff ~ network_diff */
 
@@ -5873,8 +6020,11 @@ static void add_submit(ckpool_t *ckp, stratum_instance_t *client, const double d
 	if (ckp->maxdiff)
 		optimal = MIN(optimal, normalize_pool_diff_floor(ckp->maxdiff));
 
-	/* Set to lower of optimal and network_diff */
-	optimal = MIN(optimal, network_diff);
+	/* Set to lower of optimal and network_diff, but skip the cap in cheetah
+	 * mode: 0.0025 network_diff would otherwise force miners to submit at
+	 * an absurd rate; their hashrate-derived optimal is the right limit. */
+	if (!cheetah_mode)
+		optimal = MIN(optimal, network_diff);
 
 	/* Sanity check: optimal should never be <= 0 due to clamping above,
 	 * but guard against pathological cases */
@@ -5935,8 +6085,8 @@ downstream_block(ckpool_t *ckp, sdata_t *sdata, const json_t *val, const int cbl
 
 /* We should already be holding a wb readcount. Needs to be entered with
  * client holding a ref count. */
-static void
-test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uchar *data,
+static bool
+test_blocksolve(stratum_instance_t *client, const workbase_t *wb, const uchar *data,
 		const uchar *hash, const double diff, const char *coinbase, int cblen,
 		const char *nonce2, const char *nonce, const uint32_t ntime32, const uint32_t version_mask,
 		const bool stale)
@@ -5944,21 +6094,31 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	char blockhash[68], cdfield[64], *gbt_block;
 	sdata_t *sdata = client->sdata;
 	ckpool_t *ckp = wb->ckp;
-	double network_diff;
 	json_t *val = NULL;
 	uchar flip32[32];
 	ts_t ts_now;
 	bool ret;
 
-	/* Submit anything over 99.9% of the diff in case of rounding errors */
-	network_diff = sdata->current_workbase->network_diff * 0.999;
-	if (likely(diff < network_diff))
-		return;
+	/* Submit anything over 99.9% of the diff in case of rounding errors.
+	 * Use wb->network_diff — the workbase the share was hashed against. */
+	if (likely(diff < wb->network_diff * 0.999))
+		return false;
 
-	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
+	LOGWARNING("Height: %d, User: %s - Possible %sblock solve diff %lf !",
+		   wb->height,
+		   client->workername ? client->workername : "unknown",
+		   stale ? "stale share " : "",
+		   diff);
+	/* A solve share we've already submitted must not re-enter: resubmitting
+	 * the block re-triggers block_solve()/reset_bestshares(), wiping the new
+	 * round's best shares. Bail so it falls through to normal share accounting
+	 * and is rejected as a duplicate. The fingerprint is recorded below only
+	 * on a confirmed submission, so a rejected block is not falsely matched. */
+	if (unlikely(share_exists(&sdata->share_lock, &sdata->shares, hash)))
+		return false;
 	/* Can't submit a block in proxy mode without the transactions */
 	if (!ckp->node && wb->proxy)
-		return;
+		return false;
 
 	ts_realtime(&ts_now);
 	sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
@@ -5985,6 +6145,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	json_set_uint32(val, "version_mask", version_mask);
 	json_set_int64(val, "reward", wb->coinbasevalue);
 	json_set_double(val, "diff", diff);
+	json_set_double(val, "network_diff", wb->network_diff);
 	json_set_string(val, "createdate", cdfield);
 	json_set_string(val, "createby", "code");
 	json_set_string(val, "createcode", __func__);
@@ -5999,13 +6160,27 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 
 	/* Submit block locally after sending it to remote locations avoiding
 	 * the delay of local verification */
-	ret = local_block_submit(ckp, gbt_block, flip32, wb->height);
-	if (ret)
+	ret = local_block_submit(ckp, gbt_block, flip32, wb->height, client->workername);
+	if (ret) {
+		/* Record the winning fingerprint so a resubmitted solve share is caught
+		 * by share_exists() above instead of re-triggering block_solve(). */
+		record_solve_share(&sdata->share_lock, &sdata->shares, hash, wb->id);
+		/* Record best share before block_solve() triggers reset_bestshares().
+		 * guard_round=false: reset has NOT happened yet; we want user->best_diff
+		 * and worker->best_diff set to solve diff so block_solve() logs them. */
+		if (client_gate_update(client, diff)) {
+			LOGINFO("User %s worker %s client %s new best diff %.10g",
+				client->user_instance->username, client->worker_instance->workername,
+				client->identity, diff);
+			check_best_diff(sdata, client->user_instance, client->worker_instance,
+					diff, client, wb->network_diff, false);
+		}
 		block_solve(ckp, val);
-	else
+	} else
 		block_reject(val);
 
 	json_decref(val);
+	return ret;
 }
 
 /* Entered with instance_lock held */
@@ -6030,9 +6205,9 @@ out_nouserwb:
 }
 
 /* Needs to be entered with workbase readcount and client holding a ref count. */
-static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, const workbase_t *wb,
+static double submission_diff(sdata_t *sdata, stratum_instance_t *client, const workbase_t *wb,
 			      const char *nonce2, const uint32_t ntime32, uint32_t version_mask,
-			      const char *nonce, uchar *hash, const bool stale)
+			      const char *nonce, uchar *hash, const bool stale, bool *block_solved)
 {
 	unsigned char merkle_root[32], merkle_sha[64];
 	uint32_t *data32, *swap32, benonce32;
@@ -6101,8 +6276,12 @@ static double submission_diff(sdata_t *sdata, const stratum_instance_t *client, 
 	/* Calculate the diff of the share here */
 	ret = diff_from_target(hash);
 
-	/* Test we haven't solved a block regardless of share status */
-	test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32, version_mask, stale);
+	/* Test we haven't solved a block regardless of share status.
+	 * For a confirmed solve, check_best_diff/LOGINFO run inside test_blocksolve()
+	 * before block_solve() triggers reset_bestshares().
+	 * For normal accepted shares, check_best_diff is called in parse_submit()
+	 * after validation; stale and invalid shares do not update best records. */
+	*block_solved = test_blocksolve(client, wb, swap, hash, ret, coinbase, cblen, nonce2, nonce, ntime32, version_mask, stale);
 
 	return ret;
 }
@@ -6148,42 +6327,40 @@ static void submit_share(stratum_instance_t *client, const int64_t jobid, const 
 	generator_add_send(ckp, json_msg);
 }
 
-static void check_best_diff(sdata_t *sdata, user_instance_t *user,worker_instance_t *worker,
-			    const double sdiff, stratum_instance_t *client)
+static void check_best_diff(sdata_t *sdata, user_instance_t *user, worker_instance_t *worker,
+			    const double sdiff, stratum_instance_t *client, double network_diff,
+			    bool guard_round)
 {
 	char buf[512];
-	bool best_ever = false, best_worker = false, best_user = false;
 
-	if (sdiff > user->best_ever) {
-		user->best_ever = sdiff;
-		best_ever = true;
-	}
-	if (sdiff > worker->best_ever) {
-		worker->best_ever = sdiff;
-		best_ever = true;
-	}
-	if (sdiff > worker->best_diff) {
-		worker->best_diff = sdiff;
-		best_worker = true;
-	}
-	if (sdiff > user->best_diff) {
-		user->best_diff = sdiff;
-		best_user = true;
-	}
+	best_diff_result_t r = update_best_diff(user, worker, sdiff, network_diff, guard_round);
+
+	LOGDEBUG("check_best_diff: client=%s best_ever=%d best_ever_user=%d best_ever_worker=%d best_user=%d best_worker=%d",
+		client ? client->identity : "NULL", r.best_ever, r.best_ever_user,
+		r.best_ever_worker, r.best_user, r.best_worker);
+
 	/* Check against pool's best diff unlocked first, then recheck once
-	 * the mutex is locked. */
-	if (best_user && sdiff > sdata->stats.best_diff) {
-		/* Don't set pool best diff if it's a block since we will have
-		 * reset it to zero. */
+	 * the mutex is locked. Use the caller-supplied network_diff (frozen
+	 * at share-arrival time) to avoid a race where current_workbase has
+	 * already been replaced by a ZMQ-triggered update. Pool best_diff is
+	 * a round record so guard_round applies here too. */
+	if (r.best_user && sdiff > sdata->stats.best_diff) {
 		mutex_lock(&sdata->stats_lock);
-		if (unlikely(sdiff > sdata->stats.best_diff && sdiff < sdata->current_workbase->network_diff))
+		if (unlikely(sdiff > sdata->stats.best_diff && (!guard_round || sdiff < network_diff * 0.999)))
 			sdata->stats.best_diff = sdiff;
 		mutex_unlock(&sdata->stats_lock);
 	}
-	if (likely((!best_user && !best_worker) || !client))
+	if (likely((!r.best_ever && !r.best_user && !r.best_worker) || !client)) {
+		if (client && !r.best_ever && !r.best_user && !r.best_worker)
+			LOGDEBUG("check_best_diff: suppressing client.show_message for client %s because no best flags are set",
+				client->identity);
 		return;
-	snprintf(buf, 511, "New best %sshare for %s: %lf", best_ever ? "ever " : "",
-		 best_user ? "user" : "worker", sdiff);
+	}
+	const char *subject = r.best_user ? "user"
+		: (r.best_ever_user ? "user" : "worker");
+	snprintf(buf, 511, "New best %sshare for %s: %lf", r.best_ever ? "ever " : "",
+		 subject, sdiff);
+	LOGDEBUG("check_best_diff: sending client.show_message to %s: %s", client->identity, buf);
 	stratum_send_message(sdata, client, buf);
 }
 
@@ -6207,9 +6384,10 @@ static void format_diff(char *buf, size_t len, double diff)
 static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 			    const json_t *params_val, json_t **err_val)
 {
-	bool share = false, result = false, invalid = true, submit = false, stale = false;
+	bool share = false, result = false, invalid = true, submit = false, stale = false,
+	     block_solved = false;
 	const char *workername, *job_id, *ntime, *version_mask;
-	double diff = client->diff, wdiff = 0, sdiff = -1;
+	double diff = client->diff, wdiff = 0, sdiff = -1, wb_network_diff = 0;
 	char hexhash[68] = {}, sharehash[32], cdfield[64];
 	user_instance_t *user = client->user_instance;
 	char *fname = NULL, *s, *nonce, *nonce2;
@@ -6306,6 +6484,7 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 		goto out_nowb;
 	}
 	wdiff = wb->diff;
+	wb_network_diff = wb->network_diff;
 	strncpy(idstring, wb->idstring, 20);
 	ASPRINTF(&fname, "%s.sharelog", wb->logdir);
 	/* Fix broken clients sending too many chars. Nonce2 is part of the
@@ -6334,17 +6513,15 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 	}
 	if (id < sdata->blockchange_id)
 		stale = true;
-	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_mask32, nonce, hash, stale);
-	if (sdiff > client->best_diff) {
-		worker_instance_t *worker = client->worker_instance;
-
-		client->best_diff = sdiff;
-		LOGINFO("User %s worker %s client %s new best diff %.10g", user->username,
-			worker->workername, client->identity, sdiff);
-		check_best_diff(sdata, user, worker, sdiff, client);
-	}
+	sdiff = submission_diff(sdata, client, wb, nonce2, ntime32, version_mask32, nonce, hash, stale, &block_solved);
 	bswap_256(sharehash, hash);
 	__bin2hex(hexhash, sharehash, 32);
+
+	if (block_solved) {
+		result = true;
+		submit = true;
+		goto out_put;
+	}
 
 	if (stale) {
 		/* Accept shares if they're received on remote nodes before the
@@ -6376,9 +6553,14 @@ no_stale:
 out_submit:
 	if (sdiff >= wdiff)
 		submit = true;
-	if (unlikely(sdiff >= sdata->current_workbase->network_diff)) {
-		/* Make sure we always submit any possible block solve */
-		LOGWARNING("Submitting possible block solve share diff %lf !", sdiff);
+	if (unlikely(sdiff >= wb->network_diff)) {
+		/* Make sure we always submit any possible block solve.
+		 * Use wb->network_diff — the workbase the share was hashed
+		 * against, not current_workbase which may have changed. */
+		LOGWARNING("Height: %d, User: %s - Submitting possible block solve share diff %lf !",
+			   wb->height,
+			   client->worker_instance->workername ? client->worker_instance->workername : "unknown",
+			   sdiff);
 		submit = true;
 	}
 out_put:
@@ -6388,6 +6570,8 @@ out_nowb:
 	/* Accept shares of the old diff until the next update */
 	if (id < client->diff_change_job_id)
 		diff = client->old_diff;
+	if (block_solved)
+		goto out_submit_proxy;
 	if (!invalid) {
 		char wdiffsuffix[16];
 		char sdiff_str[32], diff_str[32];
@@ -6397,9 +6581,16 @@ out_nowb:
 		suffix_string(wdiff, wdiffsuffix, 16, 0);
 		if (sdiff >= diff) {
 			if (new_share(sdata, hash, id)) {
+				result = true;
+				if (client_gate_update(client, sdiff)) {
+					LOGINFO("User %s worker %s client %s new best diff %.10g",
+						user->username, client->worker_instance->workername,
+						client->identity, sdiff);
+					check_best_diff(sdata, user, client->worker_instance,
+							sdiff, client, wb_network_diff, false);
+				}
 				LOGINFO("Accepted client %s share diff %s/%s/%s: %s",
 					client->identity, sdiff_str, diff_str, wdiffsuffix, hexhash);
-				result = true;
 			} else {
 				err = SE_DUPE;
 				*err_val = JSON_ERR(err);
@@ -6417,6 +6608,7 @@ out_nowb:
 	}  else
 		LOGINFO("Rejected client %s invalid share %s", client->identity, SHARE_ERR(err));
 
+out_submit_proxy:
 	/* Submit share to upstream pool in proxy mode. We submit valid and
 	 * stale shares and filter out the rest. */
 	if (wb && wb->proxy && submit) {
@@ -6439,6 +6631,7 @@ out_nowb:
 	json_set_string(val, "ntime", ntime);
 	json_set_double(val, "diff", diff);
 	json_set_double(val, "sdiff", sdiff);
+	json_set_double(val, "network_diff", wb_network_diff);
 	json_set_string(val, "hash", hexhash);
 	json_set_bool(val, "result", result);
 	json_object_set(val, "error", *err_val);
@@ -7193,7 +7386,7 @@ static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 	json_t *workername_val = json_object_get(val, "workername");
 	worker_instance_t *worker;
 	const char *workername;
-	double diff, sdiff = 0;
+	double diff, sdiff = 0, network_diff = 0;
 	user_instance_t *user;
 	tv_t now_t;
 
@@ -7202,15 +7395,26 @@ static void parse_remote_share(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		LOGWARNING("Failed to get workername from remote message %s", buf);
 		return;
 	}
-	if (unlikely(!json_get_double(&diff, val, "diff") || diff < 1)) {
+	if (unlikely(!json_get_double(&diff, val, "diff") || diff <= 0)) {
 		LOGWARNING("Unable to parse valid diff from remote message %s", buf);
 		return;
 	}
 	json_get_double(&sdiff, val, "sdiff");
+	/* Use the workbase's network_diff frozen at share-submission time on the
+	 * remote node. Falls back to current master network_diff for shares from
+	 * older remote nodes that don't include this field. */
+	if (!json_get_double(&network_diff, val, "network_diff") || network_diff <= 0)
+		network_diff = sdata->stats.network_diff;
 	user = generate_remote_user(ckp, workername);
 	user->authorised = true;
 	worker = get_worker(sdata, user, workername);
-	check_best_diff(sdata, user, worker, sdiff, NULL);
+	/* A remote node sends both SM_BLOCK and SM_SHARE for a solve share.
+	 * SM_BLOCK arrives first via parse_remote_block which calls
+	 * reset_bestshares (zeroing best_diff). The SM_SHARE then arrives
+	 * here; guard_round=true prevents the solve diff from being written
+	 * into user/worker best_diff (which would poison the fresh round).
+	 * best_ever is still updated if the solve beats the all-time record. */
+	check_best_diff(sdata, user, worker, sdiff, NULL, network_diff, true);
 
 	mutex_lock(&sdata->uastats_lock);
 	sdata->stats.unaccounted_shares++;
@@ -7424,11 +7628,13 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 	if (cnfrm && cnfrm[0] == '1')
 		goto out_add;
 
+	workername = json_string_value(workername_val);
 	json_get_int64(&id, val, "workinfoid");
 	coinbasehex = json_string_value(json_object_get(val, "coinbasehex"));
 	swaphex = json_string_value(json_object_get(val, "swaphex"));
 	json_get_int(&cblen, val, "cblen");
 	json_get_double(&diff, val, "diff");
+	json_get_int(&height, val, "height");
 
 	if (likely(id && coinbasehex && swaphex && cblen))
 		wb = get_remote_workbase(sdata, id, client_id);
@@ -7440,7 +7646,10 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		char *coinbase = alloca(cblen), *gbt_block;
 		char blockhash[68];
 
-		LOGWARNING("Possible remote block solve diff %lf !", diff);
+		LOGWARNING("Height: %d, User: %s - Possible remote block solve diff %lf !",
+			   height,
+			   workername ? workername : "unknown",
+			   diff);
 		hex2bin(coinbase, coinbasehex, cblen);
 		hex2bin(swap, swaphex, 80);
 		sha256(swap, 80, hash1);
@@ -7449,11 +7658,18 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		/* Note nodes use jobid of the mapped_id instead of workinfoid */
 		json_set_int64(val, "jobid", wb->mapped_id);
 		send_nodes_block(sdata, val, client_id);
+		/* A duplicate SM_BLOCK must not resubmit and re-trigger
+		 * reset_bestshares(), which would wipe the new round's best shares.
+		 * local_block_submit() normally frees gbt_block, so free it here when
+		 * we skip the submission. */
+		if (unlikely(share_exists(&sdata->share_lock, &sdata->shares, hash)))
+			free(gbt_block);
 		/* We rely on the remote server to give us the ID_BLOCK
 		 * responses, so only use this response to determine if we
 		 * should reset the best shares. */
-		if (local_block_submit(ckp, gbt_block, flip32, wb->height)) {
-			block_share_summary(sdata);
+		else if (local_block_submit(ckp, gbt_block, flip32, wb->height, workername)) {
+			record_solve_share(&sdata->share_lock, &sdata->shares, hash, wb->id);
+			block_share_summary(sdata, wb->height, NULL, workername, wb->network_diff);
 			reset_bestshares(sdata);
 		}
 		put_remote_workbase(sdata, wb);
@@ -8974,7 +9190,7 @@ static void *zmqnotify(void *arg)
 
 void *stratifier(void *arg)
 {
-	pthread_t pth_blockupdate, pth_statsupdate, pth_throbber, pth_zmqnotify;
+	pthread_t pth_blockupdate, pth_statsupdate, pth_throbber, pth_zmqnotify, pth_cheetahwatch;
 	proc_instance_t *pi = (proc_instance_t *)arg;
 	int threads, tvsec_diff = 0;
 	ckpool_t *ckp = pi->ckp;
@@ -8987,6 +9203,12 @@ void *stratifier(void *arg)
 	ckp->sdata = sdata;
 	sdata->ckp = ckp;
 	sdata->verbose = true;
+
+	/* CHTA: seed the cheetah nBits with the known constant for the current
+	 * fork era (nCheetah = powLimit * 400 = diff 0.0025). The cache lets the
+	 * override fire even before we observe a cheetah block as a GBT parent;
+	 * the learning logic in add_base updates it if the chain ever changes. */
+	snprintf(sdata->cheetah_bits, sizeof(sdata->cheetah_bits), "1e018fff");
 
 	/* Wait for the generator to have something for us */
 	while (!ckp->proxy && !ckp->generator_ready)
@@ -9054,9 +9276,10 @@ void *stratifier(void *arg)
 
 	cklock_init(&sdata->txn_lock);
 	cklock_init(&sdata->workbase_lock);
-	if (!ckp->proxy)
+	if (!ckp->proxy) {
 		create_pthread(&pth_blockupdate, blockupdate, ckp);
-	else {
+		create_pthread(&pth_cheetahwatch, cheetahwatch, ckp);
+	} else {
 		mutex_init(&sdata->proxy_lock);
 	}
 

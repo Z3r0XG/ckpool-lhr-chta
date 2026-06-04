@@ -213,6 +213,34 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
 	gbt->flags = strdup(flags);
 
+	/* CHTA: fetch the parent block's timestamp and nBits. The stratifier
+	 * uses prev_block_time to decide when an inflated ntime (parent+241)
+	 * legally unlocks the 0.0025 cheetah difficulty, and prev_block_bits
+	 * to learn the cheetah nBits value from observed easy blocks. */
+	{
+		char blk_req[320];
+		json_t *blk_val;
+
+		snprintf(blk_req, sizeof(blk_req),
+			 "{\"id\":\"ckpool\",\"method\":\"getblockheader\","
+			 "\"params\":[\"%s\"]}", previousblockhash);
+		blk_val = json_rpc_call(cs, blk_req);
+		if (blk_val) {
+			json_t *blk_res = json_object_get(blk_val, "result");
+
+			if (blk_res) {
+				const char *pbits;
+
+				gbt->prev_block_time = (uint32_t)json_integer_value(
+					json_object_get(blk_res, "time"));
+				pbits = json_string_value(json_object_get(blk_res, "bits"));
+				if (pbits)
+					snprintf(gbt->prev_block_bits, 9, "%s", pbits);
+			}
+			json_decref(blk_val);
+		}
+	}
+
 	ret = true;
 out:
 	json_decref(val);
@@ -315,13 +343,22 @@ out:
 	return ret;
 }
 
-bool submit_block(connsock_t *cs, const char *params)
+bool submit_block(connsock_t *cs, const char *params, int height, const char *workername)
 {
 	json_t *val, *res_val;
 	int len, retries = 0;
 	const char *res_ret;
+	const char *submit_user = workername ? workername : NULL;
+	char prefix[256] = "";
 	bool ret = false;
 	char *rpc_req;
+
+	if (height >= 0) {
+		if (submit_user)
+			snprintf(prefix, sizeof(prefix), "Height: %d, User: %s - ", height, submit_user);
+		else
+			snprintf(prefix, sizeof(prefix), "Height: %d - ", height);
+	}
 
 	len = strlen(params) + 64;
 retry:
@@ -330,14 +367,14 @@ retry:
 	val = json_rpc_call(cs, rpc_req);
 	dealloc(rpc_req);
 	if (!val) {
-		LOGWARNING("%s:%s Failed to get valid json response to submitblock", cs->url, cs->port);
+		LOGWARNING("%s%s:%s Failed to get valid json response to submitblock", prefix, cs->url, cs->port);
 		if (++retries < 5)
 			goto retry;
 		return ret;
 	}
 	res_val = json_object_get(val, "result");
 	if (!res_val) {
-		LOGWARNING("Failed to get result in json response to submitblock");
+		LOGWARNING("%sFailed to get result in json response to submitblock", prefix);
 		if (++retries < 5) {
 			json_decref(val);
 			goto retry;
@@ -347,37 +384,20 @@ retry:
 	if (!json_is_null(res_val)) {
 		res_ret = json_string_value(res_val);
 		if (res_ret && strlen(res_ret)) {
-			LOGWARNING("SUBMIT BLOCK RETURNED: %s", res_ret);
+			LOGWARNING("%sSUBMIT BLOCK RETURNED: %s", prefix, res_ret);
 			/* Consider duplicate response as an accepted block */
 			if (safecmp(res_ret, "duplicate"))
 				goto out;
 		} else {
-			LOGWARNING("SUBMIT BLOCK GOT NO RESPONSE!");
+			LOGWARNING("%sSUBMIT BLOCK GOT NO RESPONSE!", prefix);
 			goto out;
 		}
 	}
-	LOGWARNING("BLOCK ACCEPTED!");
+	LOGWARNING("%sBLOCK ACCEPTED!", prefix);
 	ret = true;
 out:
 	json_decref(val);
 	return ret;
-}
-
-void precious_block(connsock_t *cs, const char *params)
-{
-	char *rpc_req;
-	int len;
-
-	if (unlikely(!cs->alive)) {
-		LOGDEBUG("Failed to submit_txn due to connsock dead");
-		return;
-	}
-
-	len = strlen(params) + 64;
-	rpc_req = ckalloc(len);
-	sprintf(rpc_req, "{\"method\": \"preciousblock\", \"params\": [\"%s\"]}\n", params);
-	json_rpc_msg(cs, rpc_req);
-	dealloc(rpc_req);
 }
 
 void submit_txn(connsock_t *cs, const char *params)

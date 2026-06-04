@@ -37,7 +37,9 @@ check_PROGRAMS = \
 	unit/test-persistent-ua-tracking \
 	unit/test-zombie-cleanup \
 	unit/test-auth-rejection \
-	unit/test-logmsg
+	unit/test-logmsg \
+	unit/test-bestdiff-reset \
+	unit/test-solve-dedupe
 
 TESTS = $(check_PROGRAMS)
 
@@ -165,6 +167,13 @@ unit_test_zombie_cleanup_SOURCES = \
 # LOGMSGSIZ chunking / log truncation fix tests
 unit_test_logmsg_SOURCES = \
 	unit/test-logmsg.c
+
+# best_diff / best_ever reset on block solve tests
+unit_test_bestdiff_reset_SOURCES = \
+	unit/test-bestdiff-reset.c
+
+unit_test_solve_dedupe_SOURCES = \
+	unit/test-solve-dedupe.c
 
 # All tests depend on libckpool
 $(check_PROGRAMS): $(top_builddir)/src/libckpool.a

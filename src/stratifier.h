@@ -39,6 +39,9 @@ struct genwork {
 	double network_diff;
 	uint32_t version;
 	uint32_t curtime;
+	uint32_t prev_block_time; /* timestamp of the parent block (from getblock) */
+	char prev_block_bits[12]; /* compact nBits of the parent block */
+	bool cheetah_mode;        /* true when using CHTA inflated ntime for 0.0025 diff */
 	char prevhash[68];
 	char ntime[12];
 	uint32_t ntime32;

@@ -8,46 +8,50 @@
  * (for vardiff) and network difficulty (threshold for block detection).
  * 
  * KEY CONCEPTS:
- * 
+ *
  * WORKER DIFFICULTY: Vardiff-managed difficulty for the miner.
- *   - Set by pool's vardiff algorithm (optimal_diff = dsps * 3.33)
+ *   - Target from hashrate: optimal = dsps * 1.0 (~1 share/sec). CHTA uses a
+ *     faster cadence than stock's dsps * 3.33 so a miner's next share lands
+ *     within ~1s when a cheetah window opens.
  *   - Clamped by pool constraints: mindiff <= final_diff <= maxdiff
  *   - Can be BELOW network_diff (miner gets partial shares)
  *   - Constrains: vardiff adjustments, share variance tracking
- * 
- * NETWORK DIFFICULTY: Bitcoin protocol threshold for valid blocks.
- *   - Extracted from block header (diff_from_nbits)
+ *
+ * NETWORK DIFFICULTY: protocol threshold for valid blocks.
+ *   - Extracted from block header nBits, used RAW (unclamped).
+ *   - CHTA legitimately mines sub-1.0 difficulty (cheetah blocks at 0.0025),
+ *     so there is NO floor. The old allow_low_diff clamp-to-1.0 was removed
+ *     for this fork; forks without cheetah mode may still clamp.
  *   - Not a constraint on worker_diff, they're independent
- *   - Shares >= network_diff are submitted as potential blocks
- *   - Used in: block detection, pool statistics, mining profitability
- * 
- * ALLOW_LOW_DIFF FLAG: Enables regtest/testnet support.
- *   - When false (production): network_diff < 1.0 clamped to 1.0
- *   - When true (regtest): network_diff can be fractional (e.g., 0.5)
- *   - Only affects network_diff reporting, not worker_diff constraints
- * 
+ *   - Shares >= network_diff * 0.999 are submitted as potential blocks
+ *
  * CONSTRAINT HIERARCHY (for worker difficulty ONLY):
- * 1. Optimal difficulty = dsps * 3.33
+ * 1. Optimal difficulty = dsps * 1.0
  * 2. Pool global: pool_mindiff (floor), pool_maxdiff (ceiling)
  * 3. Pool per-worker: startdiff (initial), mindiff (floor), maxdiff (ceiling)
- * 
+ *
  * FINAL RULE for worker_diff:
  * pool_mindiff <= final_diff <= pool_maxdiff
- * (network_diff is tracked separately, not a constraint)
- * 
+ * The network_diff cap (final = MIN(optimal, network_diff)) applies in normal
+ * mode but is SKIPPED in cheetah mode, where 0.0025 would otherwise force an
+ * absurd submission rate — the hashrate-derived optimal is the right limit.
+ *
  * TEST SCENARIOS:
- * - Network floor: Regtest vs. production clamping behavior
- * - Optimal vs. network: Worker diff can be below/above network diff
+ * - Optimal vs. network: Worker diff can be below/above network diff; the cap
+ *   is skipped in cheetah mode
  * - Pool constraints: Min/max bounds on worker difficulty
  * - All compose: No hidden conflicts between constraints
  * - Worker overrides: Per-worker settings override pool defaults
- * 
+ *
  * EXPECTED RESULTS:
- * - Network floor applied only when allow_low_diff=false
  * - Worker difficulty independent from network difficulty
  * - All pool constraints respected (mindiff <= diff <= maxdiff)
+ * - Network cap applied in normal mode, skipped in cheetah mode
  * - Impossible configurations detected (e.g., mindiff > maxdiff)
  */
+
+/* config.h must be first to define _GNU_SOURCE before system headers */
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,12 +61,13 @@
 #include <stdbool.h>
 
 #include "../test_common.h"
+#include "libckpool.h"
 
-/* Helper: Calculate optimal diff from hashrate */
+/* Helper: Calculate optimal diff from hashrate (CHTA target: ~1 share/sec) */
 static double calculate_optimal_diff(double hashrate)
 {
 	double dsps = hashrate / (double)(1UL << 32);
-	return dsps * 3.33;
+	return dsps * 1.0;
 }
 
 /*
@@ -72,7 +77,14 @@ static double calculate_optimal_diff(double hashrate)
  * - Testnet: 1 to millions
  */
 
-/* Test 1: Network difficulty floor clamping */
+/* Test 1: Network difficulty floor clamping.
+ *
+ * DISABLED for the CHTA fork: this validates the old allow_low_diff clamp
+ * (network_diff < 1.0 -> 1.0), which was removed here because CHTA legitimately
+ * mines sub-1.0 cheetah blocks (0.0025). Asserting 0.5 -> 1.0 is the inverse of
+ * current behavior. Kept under #if 0 because it remains valid for forks that
+ * retain the allow_low_diff floor (e.g. non-cheetah ckpool-lhr variants). */
+#if 0
 static void test_network_diff_floor_clamping(void)
 {
 	printf("\n  Testing network difficulty floor behavior:\n");
@@ -113,6 +125,7 @@ static void test_network_diff_floor_clamping(void)
 		assert_double_equal(network_diff, scenarios[i].expected_floor, EPSILON_DIFF);
 	}
 }
+#endif /* allow_low_diff floor test — invalid for CHTA, kept for other forks */
 
 /* Test 2: Optimal diff vs network diff cap */
 static void test_optimal_capped_by_network_diff(void)
@@ -123,40 +136,48 @@ static void test_optimal_capped_by_network_diff(void)
 		const char *scenario;
 		double hashrate;
 		double network_diff;
+		bool cheetah_mode;
 		bool should_cap;
 	} scenarios[] = {
 		/* Low hashrate, high network: no cap needed */
-		{ "Low hashrate (100 H/s), Bitcoin mainnet (1B)", 100.0, 1000000000.0, false },
-		
+		{ "Low hashrate (100 H/s), Bitcoin mainnet (1B)", 100.0, 1000000000.0, false, false },
+
 		/* High hashrate, low network: needs cap */
-		{ "ASIC (100 TH/s), low network (1000)", 100000000000000.0, 1000.0, true },
-		
+		{ "ASIC (100 TH/s), low network (1000)", 100000000000000.0, 1000.0, false, true },
+
 		/* Extreme: massive ASIC on regtest */
-		{ "ASIC (1 EH/s), regtest (0.5)", 1000000000000000.0, 0.5, true },
-		
+		{ "ASIC (1 EH/s), regtest (0.5)", 1000000000000000.0, 0.5, false, true },
+
 		/* Reasonable high-end */
-		{ "Mid ASIC (100 GH/s), testnet (100000)", 100000000000.0, 100000.0, false },
+		{ "Mid ASIC (100 GH/s), testnet (100000)", 100000000000.0, 100000.0, false, false },
+
+		/* Cheetah window: cap is SKIPPED even though optimal >> network_diff,
+		 * so the miner keeps its hashrate-derived diff instead of 0.0025. */
+		{ "ASIC in cheetah window (net 0.0025)", 100000000000000.0, 0.0025, true, false },
 	};
-	
+
 	for (int i = 0; i < (int)(sizeof(scenarios) / sizeof(scenarios[0])); i++) {
 		double optimal_diff = calculate_optimal_diff(scenarios[i].hashrate);
 		double network_diff = scenarios[i].network_diff;
-		
-		/* Clamping logic: final_diff = MIN(optimal, network_diff) */
+
+		/* Production clamps final_diff = MIN(optimal, network_diff), but skips
+		 * this cap in cheetah mode (stratifier.c: if (!cheetah_mode) ...). */
 		double final_diff = optimal_diff;
 		bool was_capped = false;
-		if (final_diff > network_diff) {
+		if (!scenarios[i].cheetah_mode && final_diff > network_diff) {
 			final_diff = network_diff;
 			was_capped = true;
 		}
-		
+
 		printf("    %s:\n", scenarios[i].scenario);
-		printf("      Optimal: %.2f, Network: %.2f, Final: %.2f\n",
-		       optimal_diff, network_diff, final_diff);
-		
-		/* Final must never exceed network */
-		assert_true(final_diff <= network_diff);
-		
+		printf("      Optimal: %.2f, Network: %.2f, Cheetah: %d, Final: %.2f\n",
+		       optimal_diff, network_diff, scenarios[i].cheetah_mode, final_diff);
+
+		/* Final must never exceed network — except in cheetah mode, where the
+		 * cap is intentionally skipped. */
+		if (!scenarios[i].cheetah_mode)
+			assert_true(final_diff <= network_diff);
+
 		/* Cap status must match expectation */
 		assert_true(was_capped == scenarios[i].should_cap);
 	}
@@ -224,7 +245,6 @@ static void test_all_constraints_compose(void)
 		double network_diff;
 		double pool_mindiff;
 		double pool_maxdiff;
-		bool allow_low_diff;
 	} scenarios[] = {
 		/* Typical: Bitcoin mainnet, reasonable hashrate */
 		{
@@ -233,9 +253,8 @@ static void test_all_constraints_compose(void)
 			1000000000.0,
 			0.001,
 			0.0,
-			false,
 		},
-		
+
 		/* Low hashrate IoT on mainnet */
 		{
 			"Mainnet, ESP32 (100 H/s)",
@@ -243,19 +262,17 @@ static void test_all_constraints_compose(void)
 			1000000000.0,
 			0.001,
 			0.0,
-			false,
 		},
-		
-		/* Testnet with low diff allowed */
+
+		/* Low network diff (CHTA uses raw nBits, no floor) */
 		{
-			"Testnet, low diff allowed",
+			"Low network diff (raw, unclamped)",
 			1000.0,
 			0.5,
 			0.00001,
 			0.0,
-			true,
 		},
-		
+
 		/* Pool with aggressive min/max */
 		{
 			"Pool with min=10, max=1000",
@@ -263,40 +280,37 @@ static void test_all_constraints_compose(void)
 			1000000000.0,
 			10.0,
 			1000.0,
-			false,
 		},
-		
-		/* Regtest edge case - low hashrate on testnet with low diff allowed */
+
+		/* Cheetah-range network diff with tiny hashrate */
 		{
-			"Regtest, low hashrate allowed",
+			"Cheetah-range net diff (0.0025-scale)",
 			1.0,  /* 1 H/s theoretical */
 			0.01,
 			0.001,
 			0.0,
-			true,
 		},
 	};
 	
 	for (int i = 0; i < (int)(sizeof(scenarios) / sizeof(scenarios[0])); i++) {
 		double optimal_diff = calculate_optimal_diff(scenarios[i].hashrate);
 		double network_diff = scenarios[i].network_diff;
-		
-		/* Step 1: Network difficulty floor (only affects reporting, not worker diff) */
-		if (!scenarios[i].allow_low_diff && network_diff < 1.0)
-			network_diff = 1.0;
-		
-		/* Step 2: Calculate worker difficulty starting from optimal */
+
+		/* CHTA uses raw network_diff (no allow_low_diff floor). It is the
+		 * block-detection threshold and does NOT constrain worker diff. */
+
+		/* Calculate worker difficulty starting from optimal */
 		double worker_diff = optimal_diff;
-		
-		/* Step 3: Apply pool constraints (INDEPENDENT of network_diff) */
+
+		/* Apply pool constraints (INDEPENDENT of network_diff) */
 		if (worker_diff < scenarios[i].pool_mindiff)
 			worker_diff = scenarios[i].pool_mindiff;
 		if (scenarios[i].pool_maxdiff > 0 && worker_diff > scenarios[i].pool_maxdiff)
 			worker_diff = scenarios[i].pool_maxdiff;
-		
+
 		printf("    %s:\n", scenarios[i].scenario);
 		printf("      Hashrate: %.0f H/s\n", scenarios[i].hashrate);
-		printf("      Network diff (after floor): %.2f (for block detection, not a constraint)\n", network_diff);
+		printf("      Network diff (raw): %.2f (for block detection, not a constraint)\n", network_diff);
 		printf("      Optimal worker diff: %.2f\n", optimal_diff);
 		printf("      Pool constraints: [%.2f, %.2f]\n",
 		       scenarios[i].pool_mindiff,
@@ -449,15 +463,178 @@ static void test_constraint_conflicts_impossible(void)
 	}
 }
 
+/* Test 7: Block-solve threshold uses workbase network_diff, not current_workbase
+ *
+ * Regression test for the race where current_workbase is updated by ZMQ before
+ * the threshold check runs. The threshold must use wb->network_diff (the workbase
+ * the share was hashed against), not any global current value.
+ */
+static void test_blocksolve_threshold_uses_wb_network_diff(void)
+{
+	printf("\n  Testing block-solve threshold uses workbase network_diff:\n");
+
+	struct {
+		const char *scenario;
+		double share_diff;
+		double wb_network_diff;       /* workbase the share was hashed against */
+		double current_network_diff;  /* stale global after ZMQ update */
+		bool should_solve_with_wb;
+		bool should_solve_with_current;
+	} cases[] = {
+		/* CHTA: share just meets the workbase threshold (0.999 tolerance).
+		 * After ZMQ, current_workbase has inflated diff (retarget to 20G) —
+		 * using current would silently drop a valid block solve. */
+		{
+			"CHTA: valid solve, ZMQ updated current to 20G",
+			2577036.0,
+			2577035.681529,
+			19999698720.5,
+			true,   /* wb: 2577036 >= 2577035.68 * 0.999 ✓ */
+			false,  /* current: 2577036 < 19999698720.5 * 0.999 ✗ */
+		},
+		/* BCH: per-block DAA, similar scenario */
+		{
+			"BCH: valid solve, next block has higher diff",
+			500000000.0,
+			499000000.0,
+			600000000.0,
+			true,
+			false,
+		},
+		/* Share does not meet even the workbase threshold — not a solve */
+		{
+			"Not a solve: share below wb threshold",
+			1000000.0,
+			2577035.681529,
+			2577035.681529,
+			false,
+			false,
+		},
+	};
+
+	for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+		bool wb_result      = cases[i].share_diff >= cases[i].wb_network_diff * 0.999;
+		bool current_result = cases[i].share_diff >= cases[i].current_network_diff * 0.999;
+
+		printf("    %s:\n", cases[i].scenario);
+		printf("      share_diff=%.2f, wb_network_diff=%.2f, current=%.2f\n",
+		       cases[i].share_diff, cases[i].wb_network_diff, cases[i].current_network_diff);
+		printf("      Using wb: %s | Using current: %s\n",
+		       wb_result ? "SOLVE" : "no", current_result ? "SOLVE" : "no");
+
+		assert_true(wb_result == cases[i].should_solve_with_wb);
+		assert_true(current_result == cases[i].should_solve_with_current);
+	}
+}
+
+/* Test 8: Block solve luck% formula correctness
+ *
+ * block_share_summary() computes: bdiff = accounted_diff_shares / network_diff * 100
+ *
+ * Covers the full luck range (1% to 1000%+), real CHTA block regression anchors,
+ * and edge cases at single-share and EH/s-scale share counts.
+ */
+static void test_block_luck_formula_correctness(void)
+{
+	printf("\n  Testing block solve luck%% formula correctness:\n");
+
+	struct {
+		const char *scenario;
+		double accounted_diff_shares;
+		double network_diff;
+		double expected_luck_pct;
+	} cases[] = {
+		/* Parametric: exact round-number inputs covering full luck range.
+		 * Luck% < 100 = block found in fewer shares than expected (lucky).
+		 * Luck% > 100 = block needed more shares than expected (unlucky). */
+		{ "1% luck (extremely lucky)",           10000.0,   1000000.0,     1.0 },
+		{ "10% luck (very lucky)",              100000.0,   1000000.0,    10.0 },
+		{ "50% luck",                           500000.0,   1000000.0,    50.0 },
+		{ "100% luck (exactly expected work)", 1000000.0,   1000000.0,   100.0 },
+		{ "200% luck (unlucky)",               2000000.0,   1000000.0,   200.0 },
+		{ "1000% luck (very unlucky)",        10000000.0,   1000000.0,  1000.0 },
+
+		/* Real CHTA block regression anchors — any formula change will
+		 * break these against known production values. */
+		{ "CHTA block 4765296 (11.5% luck)",    295076.0, 2577035.681529,  11.45 },
+		{ "CHTA block 4765299 (2.9% luck)",      75264.0, 2577035.681529,   2.92 },
+
+		/* Edge cases: extreme share counts must not overflow or lose precision */
+		{ "Single share (near-zero luck)",           1.0,   1000000.0,    0.0001 },
+		{ "Very large counts (EH/s-scale pool)",   1.0e15,     1.0e13, 10000.0  },
+	};
+
+	for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+		double luck = cases[i].accounted_diff_shares / cases[i].network_diff * 100.0;
+		/* Tolerance: 0.1% of expected value, floor of 0.001 for near-zero cases */
+		double tol  = fmax(cases[i].expected_luck_pct * 0.001, 0.001);
+
+		printf("    %s:\n", cases[i].scenario);
+		printf("      shares=%.6g, network_diff=%.6g → luck=%.4f%% (expected ~%.4f%%)\n",
+		       cases[i].accounted_diff_shares, cases[i].network_diff,
+		       luck, cases[i].expected_luck_pct);
+
+		assert_true(fabs(luck - cases[i].expected_luck_pct) < tol);
+	}
+}
+
+/* Test 9: add_remote_base populates network_diff via diff_from_nbits
+ *
+ * Exercises diff_from_nbits(headerbin + 72) with nBits placed at offset 72 of
+ * a 112-byte buffer — mirroring the exact call in add_remote_base(). Verifies
+ * the function returns a non-zero, correct value for known nBits inputs.
+ * Catches wrong-offset bugs and regressions in diff_from_nbits itself.
+ */
+static void test_remote_base_network_diff_populated(void)
+{
+	printf("\n  Testing diff_from_nbits(headerbin + 72) produces correct network_diff:\n");
+
+	struct {
+		const char *coin;
+		uint8_t nbits[4];  /* raw nBits bytes */
+		double expected_diff;
+		double tolerance_pct;
+	} cases[] = {
+		/* CHTA nBits 1a06829b → ~2,577,035.7 */
+		{ "CHTA (1a06829b)", { 0x1a, 0x06, 0x82, 0x9b }, 2577035.7, 0.01 },
+		/* Bitcoin genesis nBits 1d00ffff → 1.0 */
+		{ "Bitcoin genesis (1d00ffff)", { 0x1d, 0x00, 0xff, 0xff }, 1.0, 0.01 },
+	};
+
+	for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+		/* nBits at offset 72, matching add_remote_base() call site */
+		char headerbin[112];
+		double network_diff;
+		double tolerance = cases[i].expected_diff * cases[i].tolerance_pct;
+
+		memset(headerbin, 0, sizeof(headerbin));
+		memcpy(headerbin + 72, cases[i].nbits, 4);
+
+		network_diff = diff_from_nbits(headerbin + 72);
+
+		printf("    %s: diff_from_nbits(headerbin + 72) → %.4f (expected ~%.4f)\n",
+		       cases[i].coin, network_diff, cases[i].expected_diff);
+
+		/* Must be non-zero (the bug: zero-alloc without this call gives 0) */
+		assert_true(network_diff > 0.0);
+		/* Must be within tolerance of expected */
+		assert_true(fabs(network_diff - cases[i].expected_diff) < tolerance);
+	}
+}
+
 /* Main test runner */
 int main(void)
 {
-	run_test(test_network_diff_floor_clamping);
+	/* test_network_diff_floor_clamping disabled — see #if 0 above (allow_low_diff
+	 * floor removed for CHTA; valid only for non-cheetah forks). */
 	run_test(test_optimal_capped_by_network_diff);
 	run_test(test_pool_min_maxdiff_constraints);
 	run_test(test_all_constraints_compose);
 	run_test(test_worker_overrides_pool_defaults);
 	run_test(test_constraint_conflicts_impossible);
+	run_test(test_blocksolve_threshold_uses_wb_network_diff);
+	run_test(test_block_luck_formula_correctness);
+	run_test(test_remote_base_network_diff_populated);
 	printf("All tests passed!\n");
 	return 0;
 }
