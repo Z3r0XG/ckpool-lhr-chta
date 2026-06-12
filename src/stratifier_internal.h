@@ -234,9 +234,9 @@ typedef struct {
  *   the ordering; for confirmed solves check_best_diff runs before
  *   block_solve()→reset_bestshares(), so logging captures the solve diff.
  *
- * guard_round=true (remote SM_SHARE path only): SM_BLOCK fires reset_bestshares()
- *   before SM_SHARE arrives, so the round is already fresh; we must NOT write
- *   the solve diff into best_diff or it poisons the new round. */
+ * guard_round=true (remote SM_SHARE path only): SM_BLOCK has already run
+ *   reset_bestshares() for this block before SM_SHARE arrives, so a solve diff
+ *   must not be written into best_diff or it carries into the next round. */
 static inline best_diff_result_t
 update_best_diff(user_instance_t *user, worker_instance_t *worker,
 		 double sdiff, double network_diff, bool guard_round)

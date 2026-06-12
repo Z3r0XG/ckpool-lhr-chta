@@ -140,6 +140,20 @@ process_solve(stratum_instance_t *client, user_instance_t *user,
 	reset_bestshares_stub(client, user, worker, pool_best_diff);
 }
 
+/* Models test_blocksolve()'s reset decision: a non-stale solve resets the
+ * session (block_solve → reset_bestshares); a stale solve does neither. */
+static void
+process_solve_staleaware(stratum_instance_t *client, user_instance_t *user,
+			 worker_instance_t *worker, double *pool_best_diff,
+			 double sdiff, double network_diff, bool stale)
+{
+	if (!stale) {
+		process_share(client, user, worker, pool_best_diff, sdiff, network_diff);
+		reset_bestshares_stub(client, user, worker, pool_best_diff);
+	}
+	/* stale: neither capture nor reset */
+}
+
 /* -------------------------------------------------------------------------
  * Test 1: Normal share updates best_diff and best_ever
  * ------------------------------------------------------------------------- */
@@ -553,6 +567,59 @@ static void test_pool_best_diff_not_poisoned_by_solve(void)
 }
 
 /* -------------------------------------------------------------------------
+ * Test 9: A stale solve must not reset the current session
+ *
+ * A solve share from a previous round can arrive late — after the pool has
+ * already reset and advanced to a new height and begun accumulating best
+ * shares for the new session. It is still submitted (resilience), but it must
+ * NOT trigger reset_bestshares(), or it wipes the new session's bests. The
+ * winner (non-stale) still resets correctly. best_ever is never touched by the
+ * reset, so it is unaffected either way.
+ * ------------------------------------------------------------------------- */
+static void test_stale_solve_does_not_reset_session(void)
+{
+	printf("\n  Testing stale solve does not reset the current session:\n");
+
+	double network_diff = 3539393.4;
+	double solve_diff   = 4308532.0;
+
+	stratum_instance_t client = {0};
+	user_instance_t    user   = {0};
+	worker_instance_t  worker = {0};
+	double pool_bd = 0;
+
+	/* New session has accumulated best shares */
+	double round_shares[] = { 5000.0, 44508.0, 827615.0 };
+	for (int i = 0; i < 3; i++)
+		process_share(&client, &user, &worker, &pool_bd, round_shares[i], network_diff);
+
+	assert_double_equal(user.best_diff,   827615.0, 1e-6);
+	assert_double_equal(worker.best_diff, 827615.0, 1e-6);
+	assert_double_equal(client.best_diff, 827615.0, 1e-6);
+	assert_double_equal(pool_bd,          827615.0, 1e-6);
+
+	/* A STALE solve from a previous round arrives — must NOT reset. */
+	process_solve_staleaware(&client, &user, &worker, &pool_bd, solve_diff, network_diff, true);
+
+	printf("    After stale solve: user.bd=%.2f (want 827615) pool=%.2f (want 827615)\n",
+	       user.best_diff, pool_bd);
+	assert_double_equal(user.best_diff,   827615.0, 1e-6);  /* preserved */
+	assert_double_equal(worker.best_diff, 827615.0, 1e-6);
+	assert_double_equal(client.best_diff, 827615.0, 1e-6);
+	assert_double_equal(pool_bd,          827615.0, 1e-6);
+
+	/* Contrast: the real (non-stale) winner DOES reset. */
+	process_solve_staleaware(&client, &user, &worker, &pool_bd, solve_diff, network_diff, false);
+
+	printf("    After non-stale solve: user.bd=%.2f (want 0) pool=%.2f (want 0)\n",
+	       user.best_diff, pool_bd);
+	assert_double_equal(user.best_diff,   0.0, 1e-6);
+	assert_double_equal(worker.best_diff, 0.0, 1e-6);
+	assert_double_equal(client.best_diff, 0.0, 1e-6);
+	assert_double_equal(pool_bd,          0.0, 1e-6);
+}
+
+/* -------------------------------------------------------------------------
  * Main
  * ------------------------------------------------------------------------- */
 int main(void)
@@ -565,6 +632,7 @@ int main(void)
 	run_test(test_remote_solve_share_best_diff_guard);
 	run_test(test_pool_best_diff_not_poisoned_by_solve);
 	run_test(test_remote_frozen_network_diff_daa_race);
+	run_test(test_stale_solve_does_not_reset_session);
 	printf("All tests passed!\n");
 	return 0;
 }

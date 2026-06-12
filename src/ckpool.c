@@ -1811,8 +1811,8 @@ int main(int argc, char **argv)
 		ckp.donation = 0;
 	else if (ckp.donation > 99.9)
 		ckp.donation = 99.9;
-	ckp.tndonaddress = "chtaTNdonationAddrReplaceMe";
-	ckp.rtdonaddress = "chtaRTdonationAddrReplaceMe";
+	ckp.tndonaddress = "cei9NdyCSXhv1gvVmJ4CRpiRVTrdb4u23q";
+	ckp.rtdonaddress = "cVrNtejmpX7D5XJuUZkM35qSy9vcyosJmJ";
 
 	if (!ckp.btcaddress && !ckp.btcsolo && !ckp.proxy)
 		quit(0, "Non-solo mining must have a chtaaddress in config, aborting!");

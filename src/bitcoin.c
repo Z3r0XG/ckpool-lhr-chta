@@ -385,9 +385,13 @@ retry:
 		res_ret = json_string_value(res_val);
 		if (res_ret && strlen(res_ret)) {
 			LOGWARNING("%sSUBMIT BLOCK RETURNED: %s", prefix, res_ret);
-			/* Consider duplicate response as an accepted block */
-			if (safecmp(res_ret, "duplicate"))
-				goto out;
+			/* A "duplicate" response means the node already has this block
+			 * on its chain, so treat it as submitted (ret=true). Any other
+			 * non-null response is a submission failure and leaves ret false.
+			 * BLOCK ACCEPTED, logged below, is reserved for a fresh block. */
+			if (!safecmp(res_ret, "duplicate"))
+				ret = true;
+			goto out;
 		} else {
 			LOGWARNING("%sSUBMIT BLOCK GOT NO RESPONSE!", prefix);
 			goto out;

@@ -2099,13 +2099,13 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 	uchar *enonce1bin = NULL, hash[32], swap[80], flip32[32];
 	uint32_t ntime32, version_mask = 0;
 	char blockhash[68], cdfield[64];
-	int enonce1len, cblen;
+	int enonce1len, cblen, height;
 	workbase_t *wb = NULL;
 	json_t *bval;
 	double diff;
 	ts_t ts_now;
 	int64_t id;
-	bool ret;
+	bool ret, stale;
 
 	if (unlikely(!json_get_string(&enonce1, val, "enonce1"))) {
 		LOGWARNING("Failed to get enonce1 from node method block");
@@ -2172,6 +2172,15 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 
 	/* Now we have enough to assemble a block */
 	gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
+
+	/* A forwarded block already handled here must not resubmit and
+	 * re-trigger block_solve(). local_block_submit() would normally free
+	 * gbt_block, so free it here on the skipped path. */
+	if (unlikely(share_exists(&sdata->share_lock, &sdata->shares, hash))) {
+		free(gbt_block);
+		put_workbase(sdata, wb);
+		goto out;
+	}
 	ret = local_block_submit(ckp, gbt_block, flip32, wb->height, NULL);
 
 	JSON_CPACK(bval, "{si,ss,ss,sI,ss,ss,si,ss,sI,sf,sf,ss,ss,ss,ss}",
@@ -2190,11 +2199,22 @@ static void submit_node_block(ckpool_t *ckp, sdata_t *sdata, json_t *val)
 			 "createby", "code",
 			 "createcode", __func__,
 			 "createinet", ckp->serverurl[0]);
+	height = wb->height;
+	stale = (id < sdata->blockchange_id);
 	put_workbase(sdata, wb);
 
-	if (ret)
-		block_solve(ckp, bval);
-	else
+	if (ret) {
+		record_solve_share(&sdata->share_lock, &sdata->shares, hash, id);
+		/* A forwarded solve whose workbase predates the last block change
+		 * is a late or duplicate block for an already-found height: the
+		 * block is submitted, but skip block_solve() so reset_bestshares()
+		 * does not zero this node's current round best shares. */
+		if (likely(!stale))
+			block_solve(ckp, bval);
+		else
+			LOGNOTICE("Height: %d - stale upstream block solve resubmitted; not resetting current session",
+				  height);
+	} else
 		block_reject(bval);
 
 	json_decref(bval);
@@ -3688,12 +3708,13 @@ static json_t *worker_stats(const worker_instance_t *worker)
 	ghs = worker->dsps10080 * nonces;
 	suffix_string(ghs, suffix10080, 16, 0);
 
-	JSON_CPACK(val, "{ss,ss,ss,ss,ss}",
+	JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss}",
 			"hashrate1m", suffix1,
 			"hashrate5m", suffix5,
 			"hashrate1hr", suffix60,
 			"hashrate1d", suffix1440,
-			"hashrate7d", suffix10080);
+			"hashrate7d", suffix10080,
+			"useragent", worker->useragent ? worker->useragent : "");
 	return val;
 }
 
@@ -6165,17 +6186,27 @@ test_blocksolve(stratum_instance_t *client, const workbase_t *wb, const uchar *d
 		/* Record the winning fingerprint so a resubmitted solve share is caught
 		 * by share_exists() above instead of re-triggering block_solve(). */
 		record_solve_share(&sdata->share_lock, &sdata->shares, hash, wb->id);
-		/* Record best share before block_solve() triggers reset_bestshares().
-		 * guard_round=false: reset has NOT happened yet; we want user->best_diff
-		 * and worker->best_diff set to solve diff so block_solve() logs them. */
-		if (client_gate_update(client, diff)) {
-			LOGINFO("User %s worker %s client %s new best diff %.10g",
-				client->user_instance->username, client->worker_instance->workername,
-				client->identity, diff);
-			check_best_diff(sdata, client->user_instance, client->worker_instance,
-					diff, client, wb->network_diff, false);
+		if (likely(!stale)) {
+			/* Capture the solve diff into best_diff before block_solve() runs
+			 * reset_bestshares(), so block_solve() logs it (guard_round=false:
+			 * the reset has not run yet on this path). */
+			if (client_gate_update(client, diff)) {
+				LOGINFO("User %s worker %s client %s new best diff %.10g",
+					client->user_instance->username, client->worker_instance->workername,
+					client->identity, diff);
+				check_best_diff(sdata, client->user_instance, client->worker_instance,
+						diff, client, wb->network_diff, false);
+			}
+			block_solve(ckp, val);
+		} else {
+			/* Stale solve: the round has already reset and advanced to a
+			 * new height. The block is submitted above regardless, but
+			 * skipping block_solve() here avoids reset_bestshares() zeroing
+			 * the current round's best shares. */
+			LOGNOTICE("Height: %d, User: %s - stale solve resubmitted; not resetting current session",
+				  wb->height,
+				  client->workername ? client->workername : "unknown");
 		}
-		block_solve(ckp, val);
 	} else
 		block_reject(val);
 
@@ -7658,19 +7689,28 @@ static void parse_remote_block(ckpool_t *ckp, sdata_t *sdata, json_t *val, const
 		/* Note nodes use jobid of the mapped_id instead of workinfoid */
 		json_set_int64(val, "jobid", wb->mapped_id);
 		send_nodes_block(sdata, val, client_id);
-		/* A duplicate SM_BLOCK must not resubmit and re-trigger
-		 * reset_bestshares(), which would wipe the new round's best shares.
-		 * local_block_submit() normally frees gbt_block, so free it here when
-		 * we skip the submission. */
+		/* An already-recorded duplicate SM_BLOCK is skipped so it cannot
+		 * re-trigger reset_bestshares(). local_block_submit() would
+		 * normally free gbt_block, so free it here on the skipped path. */
 		if (unlikely(share_exists(&sdata->share_lock, &sdata->shares, hash)))
 			free(gbt_block);
 		/* We rely on the remote server to give us the ID_BLOCK
 		 * responses, so only use this response to determine if we
 		 * should reset the best shares. */
 		else if (local_block_submit(ckp, gbt_block, flip32, wb->height, workername)) {
-			record_solve_share(&sdata->share_lock, &sdata->shares, hash, wb->id);
-			block_share_summary(sdata, wb->height, NULL, workername, wb->network_diff);
-			reset_bestshares(sdata);
+			record_solve_share(&sdata->share_lock, &sdata->shares, hash, wb->mapped_id);
+			/* A remote solve whose workbase predates the last block change
+			 * (mapped_id < blockchange_id) is a late or duplicate SM_BLOCK for
+			 * an already-found height. The block was already submitted and
+			 * forwarded to nodes above; skip the solve summary and
+			 * reset_bestshares() so the current round's best shares survive. */
+			if (likely(wb->mapped_id >= sdata->blockchange_id)) {
+				block_share_summary(sdata, wb->height, NULL, workername, wb->network_diff);
+				reset_bestshares(sdata);
+			} else {
+				LOGNOTICE("Height: %d, User: %s - stale remote solve resubmitted; not resetting current session",
+					  wb->height, workername ? workername : "unknown");
+			}
 		}
 		put_remote_workbase(sdata, wb);
 	}
