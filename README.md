@@ -1,3 +1,5 @@
+This repository has been archived - this version of the software is no longer being developed by Z3r0XG or HeliosPool.
+
 # ckpool-lhr-chta
 
 A fork of CKPool-LHR adding Cheetahcoin (CHTA) SHA256d solo mining support,
